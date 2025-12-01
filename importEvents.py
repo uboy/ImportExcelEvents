@@ -13,6 +13,7 @@ import pytz
 # === Константы ===
 CATEGORY_NAME = "AutoImportSchedule"
 DEFAULT_EXCEL_NAME = "Расписание для студентов.xlsx"
+DEFAULT_SHEET_NAME = "1 курс"
 
 # === Настройка логирования ===
 def setup_logger(log_file):
@@ -79,7 +80,7 @@ def load_invitees(invitees_file=None, invitees_arg=None):
 
 # === Загрузка Excel ===
 def load_excel(excel_path):
-    df = pd.read_excel(excel_path, sheet_name="Лист1")
+    df = pd.read_excel(excel_path, sheet_name=DEFAULT_SHEET_NAME)
     df = df.iloc[2:].reset_index(drop=True)
     return df
 
