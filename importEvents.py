@@ -41,21 +41,51 @@ def setup_logger(log_file):
 
 # === Парсинг времени из текста ===
 def extract_times(text):
+    """
+    Возвращает список (start, end) для всех диапазонов времени в строке.
+    Поддерживает форматы:
+    - 18-21
+    - 18 - 21
+    - 18:00-21:00
+    - 18.00–21.00
+    - с 18.00 до 21.00
+    """
     if pd.isna(text):
-        return None, None
-    text = str(text).strip()
+        return []
 
-    # Формат "с 19.00 до 21.00"
-    match = re.search(r"с\s*(\d{1,2})[.:](\d{2})?\s*до\s*(\d{1,2})[.:](\d{2})?", text)
-    if match:
-        return dtime(int(match.group(1)), int(match.group(2) or 0), 0), dtime(int(match.group(3)), int(match.group(4) or 0), 0)
+    text = str(text)
 
-    # Формат "18-21"
-    match = re.search(r"(\d{1,2})\s*-\s*(\d{1,2})", text)
-    if match:
-        return dtime(int(match.group(1)), 0, 0), dtime(int(match.group(2)), 0, 0)
+    patterns = [
+        # с 18.00 до 21.00
+        r"с\s*(\d{1,2})[.:]?(\d{2})?\s*до\s*(\d{1,2})[.:]?(\d{2})?",
+        # 18-21, 18 - 21, 18:00-21:00, 18.00–21.00
+        r"(\d{1,2})[.:]?(\d{2})?\s*[-–]\s*(\d{1,2})[.:]?(\d{2})?",
+    ]
 
-    return None, None
+    results = []
+    seen = set()  # чтобы не было дублей одинаковых интервалов
+
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            g = m.groups()
+
+            st_h = int(g[0])
+            st_m = int(g[1] or 0)
+            en_h = int(g[2])
+            en_m = int(g[3] or 0)
+
+            key = (st_h, st_m, en_h, en_m)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            results.append((
+                dtime(st_h, st_m),
+                dtime(en_h, en_m)
+            ))
+
+    return results
+
 
 
 # === Загрузка участников ===
@@ -88,9 +118,11 @@ def load_excel(excel_path):
 # === Преобразование в список событий ===
 def parse_schedule(df):
     records = []
+
     for i in range(0, len(df), 2):
         if i + 1 >= len(df):
             break
+
         dates_row = df.iloc[i]
         events_row = df.iloc[i + 1]
 
@@ -107,21 +139,37 @@ def parse_schedule(df):
             except:
                 continue
 
-            # Парсим время
-            start_time, end_time = extract_times(event_val)
-            if not start_time or not end_time:
-                continue
+            # Разбиваем ячейку по строкам (если несколько событий)
+            lines = str(event_val).split("\n")
 
-            # Убираем время из текста
-            title = re.sub(r"(с\s*\d{1,2}[.:]\d{2}\s*до\s*\d{1,2}[.:]\d{2})|(\d{1,2}\s*-\s*\d{1,2})", "", str(event_val)).strip()
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
 
-            records.append({
-                "Date": date,
-                "StartTime": start_time,
-                "EndTime": end_time,
-                "Title": title
-            })
+                # Ищем ВОЗМОЖНЫЕ диапазоны времени
+                times = extract_times(line)
+
+                if not times:
+                    continue
+
+                # Убираем время из текста (оставляем только название)
+                clean_title = re.sub(
+                    r"(с\s*\d{1,2}[.:]?\d{0,2}\s*до\s*\d{1,2}[.:]?\d{0,2})|(\d{1,2}[.:]?\d{0,2}\s*[-–]\s*\d{1,2}[.:]?\d{0,2})",
+                    "",
+                    line
+                ).strip()
+
+                for start_time, end_time in times:
+                    records.append({
+                        "Date": date,
+                        "StartTime": start_time,
+                        "EndTime": end_time,
+                        "Title": clean_title
+                    })
+
     return records
+
 
 
 # === Подключение к Outlook ===
