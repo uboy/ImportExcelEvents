@@ -14,6 +14,8 @@ import pytz
 CATEGORY_NAME = "AutoImportSchedule"
 DEFAULT_EXCEL_NAME = "Расписание для студентов.xlsx"
 DEFAULT_SHEET_NAME = "1 курс"
+EXAM_DEFAULT_START = dtime(9, 0)
+EXAM_DEFAULT_END = dtime(21, 0)
 
 # === Настройка логирования ===
 def setup_logger(log_file):
@@ -125,6 +127,7 @@ def parse_schedule(df):
 
         dates_row = df.iloc[i]
         events_row = df.iloc[i + 1]
+        week_titles_processed = set()
 
         for col in df.columns:
             date_val = dates_row[col]
@@ -150,22 +153,57 @@ def parse_schedule(df):
                 # Ищем ВОЗМОЖНЫЕ диапазоны времени
                 times = extract_times(line)
 
-                if not times:
-                    continue
-
                 # Убираем время из текста (оставляем только название)
                 clean_title = re.sub(
-                    r"(с\s*\d{1,2}[.:]?\d{0,2}\s*до\s*\d{1,2}[.:]?\d{0,2})|(\d{1,2}[.:]?\d{0,2}\s*[-–]\s*\d{1,2}[.:]?\d{0,2})",
+                    r"(с\s*\d{1,2}[.:]?\d{0,2}\s*до\s*\d{1,2}[.:]?\d{0,2})|(\d{1,2}[.:]?\d{0,2}\s*[--]\s*\d{1,2}[.:]?\d{0,2})",
                     "",
                     line
                 ).strip()
+                lower_title = clean_title.lower()
+                is_exam = "экзамен" in lower_title
+                is_week_span = ("сессионная неделя" in lower_title) or ("экзаменационная неделя" in lower_title)
+
+                # Если это ячейка с недельной надписью, добавляем событие на каждый день недели (в пределах строки дат)
+                if is_week_span and clean_title not in week_titles_processed:
+                    for col_all in df.columns:
+                        date_week = dates_row[col_all]
+                        if pd.isna(date_week):
+                            continue
+                        try:
+                            date_week = pd.to_datetime(date_week).date()
+                        except Exception:
+                            continue
+                        records.append({
+                            "Date": date_week,
+                            "StartTime": None,
+                            "EndTime": None,
+                            "Title": clean_title,
+                            "AllDay": False,
+                            "ForceExamTime": True
+                        })
+                    week_titles_processed.add(clean_title)
+                    continue
+
+                # Если нет явного времени — посмотрим, что делать
+                if not times:
+                    records.append({
+                        "Date": date,
+                        "StartTime": None,
+                        "EndTime": None,
+                        "Title": clean_title,
+                        "AllDay": False,
+                        "ForceExamTime": is_exam
+                    })
+                    continue
 
                 for start_time, end_time in times:
                     records.append({
                         "Date": date,
-                        "StartTime": start_time,
-                        "EndTime": end_time,
-                        "Title": clean_title
+                        "StartTime": None if is_exam else start_time,
+                        "EndTime": None if is_exam else end_time,
+                        "Title": clean_title,
+                        "AllDay": False,
+                        "ForceExamTime": is_exam
                     })
 
     return records
@@ -333,11 +371,16 @@ def delete_old_events(calendar, delete_all=False):
 
 
 # === Добавление новых событий ===
-def add_events(calendar, records, invitees, offset_hours=3):
+def add_events(calendar, records, invitees, offset_hours=3, default_start=None, default_end=None,
+               exam_start=None, exam_end=None):
     """
     Добавляет события в календарь. Временно применяет смещение offset_hours к Start/End.
     offset_hours: целое число часов, которое прибавляется к времени события (можно 0 чтобы отключить).
     """
+    default_start = default_start or dtime(18, 0)
+    default_end = default_end or dtime(21, 0)
+    exam_start = exam_start or EXAM_DEFAULT_START
+    exam_end = exam_end or EXAM_DEFAULT_END
     added_count = 0
     outlook = win32.Dispatch("Outlook.Application")
 
@@ -357,12 +400,21 @@ def add_events(calendar, records, invitees, offset_hours=3):
         moscow_tz = None
 
     for event in records:
-        # наивный datetime (без tzinfo)
-        start_dt = datetime.combine(event["Date"], event["StartTime"])
-        end_dt = datetime.combine(event["Date"], event["EndTime"])
+        is_all_day = event.get("AllDay", False)
+        is_exam = event.get("ForceExamTime", False)
 
-        # Применяем временное смещение (workaround)
-        if offset_hours:
+        if is_exam:
+            start_time = exam_start
+            end_time = exam_end
+        else:
+            start_time = event["StartTime"] or default_start
+            end_time = event["EndTime"] or default_end
+
+        start_dt = datetime.combine(event["Date"], start_time)
+        end_dt = datetime.combine(event["Date"], end_time)
+
+        # Применяем временное смещение (workaround), но не трогаем экзамены
+        if offset_hours and not is_exam:
             orig_start = start_dt
             orig_end = end_dt
             start_dt = start_dt + timedelta(hours=offset_hours)
@@ -371,7 +423,7 @@ def add_events(calendar, records, invitees, offset_hours=3):
 
         # Защита: если после смещения конец <= началу, делаем продолжительность 1 час
         if end_dt <= start_dt:
-            logging.warning(f"End <= Start для события '{event['Title']}' после смещения — исправляю (добавляю 1 час).")
+            logging.warning(f"End <= Start для события '{event['Title']}' после смещения - исправляю (добавляю 1 час).")
             end_dt = start_dt + timedelta(hours=1)
 
         try:
@@ -381,6 +433,7 @@ def add_events(calendar, records, invitees, offset_hours=3):
             # Передаем наивные datetime (Outlook ожидает без tzinfo)
             appt.Start = start_dt
             appt.End = end_dt
+            appt.AllDayEvent = is_all_day
 
             # Пробуем явно указать таймзону, если смогли получить объект
             try:
@@ -430,6 +483,20 @@ def add_events(calendar, records, invitees, offset_hours=3):
     return added_count
 
 
+def parse_time_arg(text, default):
+    """Парсит время из аргумента CLI форматов HH или HH:MM/HH.MM."""
+    if text is None:
+        return default
+    m = re.match(r"^\\s*(\\d{1,2})(?:[.:](\\d{1,2}))?\\s*$", text)
+    if not m:
+        raise ValueError(f"Неверный формат времени: {text}")
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    if hour > 23 or minute > 59:
+        raise ValueError(f"Неверное время: {text}")
+    return dtime(hour, minute)
+
+
 # === Основная функция ===
 def main():
     parser = argparse.ArgumentParser(description="Импорт расписания в Outlook.")
@@ -439,8 +506,21 @@ def main():
     parser.add_argument("--delete-all", action="store_true", help="Удалить все события, созданные скриптом, без добавления новых")
     parser.add_argument("--offset-hours", type=int, default=3,
                         help="Временный workaround: прибавлять N часов к Start/End (по умолчанию 3). Установите 0 чтобы отключить.")
+    parser.add_argument("--default-start", help="Старт для событий без времени (HH или HH:MM). По умолчанию 18:00.")
+    parser.add_argument("--default-end", help="Конец для событий без времени (HH или HH:MM). По умолчанию 21:00.")
+    parser.add_argument("--exam-start", help="Старт для экзаменов и сессионных недель (HH или HH:MM). По умолчанию 09:00.")
+    parser.add_argument("--exam-end", help="Конец для экзаменов и сессионных недель (HH или HH:MM). По умолчанию 21:00.")
 
     args = parser.parse_args()
+
+    try:
+        default_start_time = parse_time_arg(args.default_start, dtime(18, 0))
+        default_end_time = parse_time_arg(args.default_end, dtime(21, 0))
+        exam_start_time = parse_time_arg(args.exam_start, EXAM_DEFAULT_START)
+        exam_end_time = parse_time_arg(args.exam_end, EXAM_DEFAULT_END)
+    except ValueError as e:
+        print(str(e))
+        sys.exit(1)
 
     # Путь к скрипту или exe
     base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -479,7 +559,9 @@ def main():
     delete_old_events(calendar, delete_all=False)
 
     # Добавляем новые события
-    add_events(calendar, records, invitees)
+    add_events(calendar, records, invitees, offset_hours=args.offset_hours,
+               default_start=default_start_time, default_end=default_end_time,
+               exam_start=exam_start_time, exam_end=exam_end_time)
 
 
 if __name__ == "__main__":
